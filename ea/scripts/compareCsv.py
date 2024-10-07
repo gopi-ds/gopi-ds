@@ -43,10 +43,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Input files
-before_file = "before_retention_policy_map.csv"
-after_file = "after_retention_policy_map.csv"
-retention_policies_csv = "retention_policies.csv"
-differences_file_base = "differences"
+before_file = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\BNY\\ISSv2\\BNY_APAC_SINC_16837\\SINC-16837__BNYM_PRODAPAC__Pre_Ingestion__Retention_Report.csv"
+after_file = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\BNY\\ISSv2\\BNY_APAC_SINC_16837\\SINC-16837__BNYM_PRODAPAC__Post_Ingestion__Retention_Report.csv"
+retention_policies_csv = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\BNY\\ISSv2\BNY_APAC_SINC_16837\\bnym_prod_apac_rps.csv"
+differences_file_base = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\BNY\\ISSv2\\BNY_APAC_SINC_16837\\SINC-16837__BNYM_PRODAPAC__Post_Ingestion__Retention_Report_Differences.csv"
 differences_file_ext = ".csv"
 
 # Fields to sort by

@@ -46,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pymongo import MongoClient, errors
 
 # Read configuration from JSON file
-with open('mongoConfig/dumpFromMongo.json', 'r') as config_file:
+with open('config/eu-west-2-natwest.json', 'r') as config_file:
     config = json.load(config_file)
 
 # Extract MongoDB configuration
@@ -104,7 +104,7 @@ def process_chunk(values_chunk):
 
 def process_values_in_chunks(file_path, chunk_size=10240):
     try:
-        with open(file_path, 'r') as file:
+        with open(file_path, 'r', encoding='utf-8') as file:
             chunk = []
             for line in file:
                 value = line.strip()
@@ -134,7 +134,7 @@ if __name__ == "__main__":
     total_rows_processed = 0
     csv_buffer = []
 
-    with open(output_file, "w", newline="") as csvfile:
+    with open(output_file, "w", newline="", encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fields_to_export)
         writer.writeheader()
 

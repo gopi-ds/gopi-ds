@@ -2,3 +2,8 @@ ea/scripts/mongoConfig
 results/
 .idea/
 ea/scripts/config
+/ea/scripts/*.json.json
+/ea/scripts/*.csv
+/ea/scripts/*.log
+/ea/scripts/*.json
+/ea/scripts/mongo_cleanup/*.log

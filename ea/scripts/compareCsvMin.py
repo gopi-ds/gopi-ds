@@ -29,15 +29,16 @@ import tempfile
 import shutil
 
 # Input file from pre-re-ingestion
-before_file = "before_retention_policy_map.csv"
+before_file = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\SINC-16972\\SINC-16972__NATWESTPROD__Pre_Ingestion_Report.csv"
 
 # Reference file from post-re-ingestion
-after_file = "after_retention_policy_map.csv"
+after_file = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\SINC-16972\\SINC-16972__NATWESTPROD__Post_Ingestion_Report.csv"
 
 # File to write the differences
-differences_file = "all_differences.csv"
+differences_file = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\SINC-16972\\SINC-16972__NATWESTPROD__Post_Ingestion_Retention_Report_Differences.csv"
 
-retention_policies_csv = 'rps.csv'
+retention_policies_csv = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\SINC-16972\\natwest_rps.csv"
+
 retention_policies_columns = ['policyId', 'name']  # Replace with your actual column names
 
 # Fields to sort by

@@ -21,34 +21,23 @@ def read_config(file_path):
     return config
 
 # Step 2: Connect to MongoDB using details from the config file
-config = read_config(r'./config/old-us-east-1-bnym-nam.json')  # Use raw string or double backslashes
+config = read_config(r'./config/old-mt-prod.json')  # Use raw string or double backslashes
 
 client = MongoClient(config['MongoDB']['uri'])
 db = client[config['MongoDB']['database']]
-#collection = db[config['MongoDB']['collection']]
-collection = db['retention_policies']
+collection = db[config['MongoDB']['collection']]
 
 # Step 3: Define the query and projection
-query = {}
-#query = {'enabled': True}
+query = {
+    'holdRequestId': '0180ea42-604c-4889-8d8b-13cfc6359f53',
+    'status': {'$ne': 'SUCCESS'}
+}
 projection = {
-    'policyId': 1,
-    'name': 1,
-    'sourceType': 1,
-    'category': 1,
-    'storeType': 1,
-    'retentionPeriod': 1,
-    'unitOfPeriod': 1,
-    'expiryAction': 1,
-    'scope': 1,
-    'createdDate': 1,
-    'lastUpdated': 1,
+    'snapshotId': 1,
     '_id': 0  # Exclude the _id field
 }
 
 # Step 4: Perform the query and sort the results
-#sort_criteria = [('unitOfPeriod', 1), ('retentionPeriod', 1)]
-#results = collection.find(query, projection).sort(sort_criteria)
 results = collection.find(query, projection)
 
 # Step 5: Write the results to a CSV file
@@ -75,7 +64,7 @@ def write_to_csv(results, output_file):
             writer.writerow(document)
 
 # Specify the output CSV file
-output_csv = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\BNY\\ISSv2\\BNY_NAM_SINC_16852\\bnymprodnam_rps.csv"
+output_csv = "C:\\Users\\saigopinath.dokku\\OneDrive - Smarsh, Inc\\EA\\SINC-16365\\dtcc_2019_snapshots.csv"
 
 # Write the results to the CSV file
 write_to_csv(results, output_csv)

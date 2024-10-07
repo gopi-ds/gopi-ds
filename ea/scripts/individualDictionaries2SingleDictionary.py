@@ -23,42 +23,34 @@ IYKYK
 import json
 import re
 
-
-# Function to correct JSON formatting by adding double quotes when needed
-def correct_json_formatting(line):
-    # Replace single quotes around keys and values with double quotes
-    line = re.sub(r"(?<!\")(\b\w+\b)(?=\s*:)", r'"\1"', line)  # Add double quotes around keys
-    line = re.sub(r"':\s*'([^']*)'", r'": "\1"', line)  # Replace single quotes around values with double quotes
-    line = line.replace("'", '"')  # Replace any remaining single quotes with double quotes
-    return line
-
+# Function to correct JSON formatting by adding necessary brackets
+def correct_json_formatting(content):
+    content = content.strip().strip(',')  # Remove any leading/trailing whitespace or stray commas
+    content = "[" + content + "]"  # Wrap the entire content in brackets to form a valid JSON array
+    return content
 
 # File paths
-input_file = 'es_results.json'
-output_file = 'es_results_output.json'
+input_file = "C:\\Users\\saigopinath.dokku\\Downloads\\gcid_es_list.txt"
+output_file = 'gcid_es_list.json'
 
-input_data = []
-
-# Use with statement to ensure the file is properly closed
+# Read the entire content of the file
 try:
     with open(input_file, 'r') as infile:
-        for line in infile:
-            try:
-                corrected_line = correct_json_formatting(line.strip())
-                input_data.append(json.loads(corrected_line))
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON on line: {line.strip()}")
-                print(f"Corrected line: {corrected_line}")
-                print(f"Error: {e}")
+        content = infile.read()
+        corrected_content = correct_json_formatting(content)
+
+        try:
+            input_data = json.loads(corrected_content)  # Parse the corrected JSON
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}")
+            input_data = []
 except FileNotFoundError:
     print(f"Input file {input_file} not found.")
+    input_data = []
 
 if input_data:
-    # Extract gcid values and combine into a single dictionary with a list of gcids
-    output_data = {"gcid": [item["gcid"] for item in input_data]}
-
-    # Print the result
-    #print(output_data)
+    # Extract gcid values and combine them into a single dictionary with a list of gcids
+    output_data = {"gcids": [item.get("gcid") for item in input_data if "gcid" in item]}
 
     # Write the output to a file using with statement
     with open(output_file, 'w') as outfile:
