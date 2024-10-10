@@ -113,7 +113,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # Number of slices (adjust based on your environment and number of threads)
-    total_slices = 10  # Can be increased depending on cluster size and workload
+    total_slices = 24  # Can be increased depending on cluster size and workload
     max_threads = total_slices
 
     # Use ThreadPoolExecutor to parallelize fetching from multiple slices
