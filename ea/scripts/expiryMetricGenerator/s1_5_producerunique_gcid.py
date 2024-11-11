@@ -68,14 +68,20 @@ temp_collection_name = runtime_config.get("temp_collection") or f"temp_unique_gc
 temp_collection = tenant_db[temp_collection_name]
 tracking_collection = tenant_db[f"{temp_collection_name}_tracking"]
 
-# Ensure index on gcId if this is a new temporary collection
-if not runtime_config.get("temp_collection"):
-    @retry_on_failure()
-    def create_unique_index():
-        temp_collection.create_index("gcId", unique=True)
-        logging.info(f"Created unique index on gcId for {temp_collection_name}")
+@retry_on_failure()
+def ensure_index_on_gcId():
+    """Ensures an index on 'gcId' exists in the temporary collection."""
+    indexes = temp_collection.list_indexes()
+    index_exists = any(index['key'] == {'gcId': 1} for index in indexes)
 
-    create_unique_index()
+    if not index_exists:
+        temp_collection.create_index("gcId", unique=True)
+        logging.info("Created unique index on 'gcId' for collection: %s", temp_collection_name)
+    else:
+        logging.info("Index on 'gcId' already exists in collection: %s", temp_collection_name)
+
+# Call to ensure index on 'gcId' after defining `temp_collection`
+ensure_index_on_gcId()
 
 # Functions to manage last_id and script status in the tracking collection
 def get_last_processed_id():
