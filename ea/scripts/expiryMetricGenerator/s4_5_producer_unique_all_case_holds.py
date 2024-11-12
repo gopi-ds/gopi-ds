@@ -204,7 +204,8 @@ def aggregate_and_process():
 
         # Mark final status as complete if not interrupted
         if not shutdown_flag:
-            update_tracking_status(last_id, processed_count, status="complete")
+            _, final_processed_count, _ = get_tracking_status()
+            update_tracking_status(last_id, final_processed_count, status="complete")
         else:
             logging.info("Processing interrupted by shutdown. Tracking status set to 'interrupted'.")
 
