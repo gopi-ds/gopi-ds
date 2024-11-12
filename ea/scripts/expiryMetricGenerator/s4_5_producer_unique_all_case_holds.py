@@ -79,6 +79,8 @@ temp_collection_name = runtime_config.get("temp_collection")
 temp_collection = tenant_db[temp_collection_name]
 tracking_collection = tenant_db[f"{temp_collection_name}_tracking"]
 
+case_fetch_batch_size = app_settings.get("case_fetch_batch_size", 10000)
+
 @retry_on_failure()
 def ensure_index_on_gcId():
     indexes = temp_collection.list_indexes()
@@ -114,32 +116,22 @@ def update_tracking_status(last_id, processed_count, status="in_progress"):
 @retry_on_failure()
 def aggregate_hold_flags():
     pipeline = [
+        # Stage 1: Group by gcid and check if any holdFlag is True
         {
             "$group": {
-                "_id": {
-                    "gcid": "$documentKey.gcid",
-                    "holdFlag": "$holdFlag"
-                },
-                "count": { "$sum": 1 }
-            }
-        },
-        {
-            "$group": {
-                "_id": "$_id.gcid",
+                "_id": "$documentKey.gcid",
                 "hasHoldFlagTrue": {
-                    "$sum": { "$cond": [{ "$eq": ["$_id.holdFlag", True] }, "$count", 0] }
-                },
-                "hasHoldFlagFalse": {
-                    "$sum": { "$cond": [{ "$eq": ["$_id.holdFlag", False] }, "$count", 0] }
+                    "$max": { "$cond": [{ "$eq": ["$holdFlag", True] }, 1, 0] }
                 }
             }
         },
+        # Stage 2: Determine case_hold based on presence of holdFlagTrue
         {
             "$project": {
                 "gcid": "$_id",
                 "case_hold": {
                     "$cond": {
-                        "if": { "$gt": ["$hasHoldFlagTrue", "$hasHoldFlagFalse"] },
+                        "if": { "$eq": ["$hasHoldFlagTrue", 1] },
                         "then": "Y",
                         "else": "N"
                     }
@@ -149,6 +141,7 @@ def aggregate_hold_flags():
         }
     ]
     return case_collection.aggregate(pipeline, allowDiskUse=True)
+
 
 @retry_on_failure()
 def process_aggregated_results(aggregated_results, processed_count):
@@ -167,7 +160,7 @@ def process_aggregated_results(aggregated_results, processed_count):
         )
 
         # Execute batch if limit is reached
-        if len(bulk_updates) >= 1000:
+        if len(bulk_updates) >= case_fetch_batch_size:
             execute_bulk_update(bulk_updates)
             processed_count += len(bulk_updates)
             bulk_updates = []  # Reset after execution
