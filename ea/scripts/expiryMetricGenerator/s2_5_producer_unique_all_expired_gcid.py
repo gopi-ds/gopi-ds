@@ -95,20 +95,35 @@ def retry_on_failure(func):
 
 @retry_on_failure
 def get_tracking_status():
-    record = tracking_collection.find_one({"script_name": "retention_policy_evaluation"})
+    try:
+        # Attempt to find the tracking record
+        record = tracking_collection.find_one({"script_name": "retention_policy_evaluation"})
+        if record is None:
+            # Insert a default record if none exists
+            default_record = {
+                "script_name": "retention_policy_evaluation",
+                "last_id": None,
+                "processed_count": 0,
+                "expired_count": 0,
+                "active_count": 0,
+                "timestamp": datetime.now(tz=timezone.utc),
+                "status": "not_started"
+            }
+            tracking_collection.insert_one(default_record)
+            logging.info("No tracking record found. Inserted default record: %s", default_record)
+            return default_record["status"], default_record["last_id"], default_record["processed_count"], default_record["expired_count"], default_record["active_count"]
+        # Return the retrieved record's values
+        return (
+            record.get("status", "not_started"),
+            record.get("last_id"),
+            record.get("processed_count", 0),
+            record.get("expired_count", 0),
+            record.get("active_count", 0)
+        )
+    except Exception as e:
+        logging.error("Error in get_tracking_status: %s", e)
+        raise
 
-    # Check if the record is None before attempting to access its fields
-    if record is None:
-        # Return default values if no document is found
-        return "not_started", None, 0, 0
-
-    # Extract values if the record exists
-    return (
-        record.get("status", "not_started"),
-        record.get("last_id"),
-        record.get("processed_count", 0),
-        record.get("expired_count", 0)
-    )
 
 @retry_on_failure
 def fetch_gc_id_batch(last_id):
@@ -160,55 +175,99 @@ def get_filter(policy):
 
 @retry_on_failure
 def evaluate_all_policies_for_a_gcid(gc_id_policies, policy_expiry_thresholds):
+    """
+    Check if all policies for a gcId are expired.
+    """
     try:
         for policy in gc_id_policies:
             policy_id = policy.get("policyId")
             expiration_date = policy_expiry_thresholds.get(policy_id)
             start_date = policy.get("startDate")
-            if expiration_date and start_date and (
-                    start_date.replace(tzinfo=timezone.utc) if start_date.tzinfo is None else start_date
-            ) >= expiration_date:
+            # Convert to UTC if `start_date` has no timezone info
+            start_date = start_date.replace(tzinfo=timezone.utc) if start_date.tzinfo is None else start_date
+            # If any policy is still active, return False
+            if expiration_date and start_date and start_date >= expiration_date:
                 return False
-        return True
+        return True  # All policies are expired
     except Exception as e:
         logging.error("Error evaluating policies for gcId: %s", e)
         raise
 
+
 @retry_on_failure
 def evaluate_policies_for_gcids(gc_id_batch, policy_expiry_thresholds):
+    """
+    Evaluate policies for a batch of gcIds, identifying expired and active gcIds.
+    Treat gcIds with no policies as expired.
+    """
     try:
         expired_gc_ids = []
-        policies = list(rpm_collection.find({"gcId": {"$in": gc_id_batch}}, {"gcId": 1, "policyId": 1, "startDate": 1}))
-
+        active_gc_ids = []
+        # Fetch policies for the given gcIds
+        policies = list(rpm_collection.find(
+            {"gcId": {"$in": gc_id_batch}},
+            {"gcId": 1, "policyId": 1, "startDate": 1}
+        ))
+        # Group policies by gcId
         policies_by_gc_id = {}
         for policy in policies:
             gc_id = policy["gcId"]
             policies_by_gc_id.setdefault(gc_id, []).append(policy)
-
-        for gc_id, gc_id_policies in policies_by_gc_id.items():
+        # Process each gcId in the batch
+        for gc_id in gc_id_batch:
+            gc_id_policies = policies_by_gc_id.get(gc_id, [])
+            if not gc_id_policies:
+                # Treat gcIds with no policies as expired
+                expired_gc_ids.append(gc_id)
+                continue
             if evaluate_all_policies_for_a_gcid(gc_id_policies, policy_expiry_thresholds):
                 expired_gc_ids.append(gc_id)
-
-        logging.info("Evaluated %d gcIds, %d are expired.", len(gc_id_batch), len(expired_gc_ids))
-        return expired_gc_ids
+            else:
+                active_gc_ids.append(gc_id)
+        logging.info(
+            "Evaluation completed: %d gcIds processed, %d expired, %d active.",
+            len(gc_id_batch),
+            len(expired_gc_ids),
+            len(active_gc_ids)
+        )
+        return expired_gc_ids, active_gc_ids
     except Exception as e:
         logging.error("Error during evaluation of policies for gcIds: %s", e)
         raise
 
+
 @retry_on_failure
-def update_temp_collection(expired_gc_ids):
-    if not expired_gc_ids:
+def update_temp_collection(expired_gc_ids, active_gc_ids):
+    """
+    Update `ret_policies_expired` to 'Y' for expired and 'N' for active gcIds.
+    """
+    if not expired_gc_ids and not active_gc_ids:
         return
     try:
-        updates = [UpdateOne({"gcId": gc_id}, {"$set": {"ret_policies_expired": "Y"}}, upsert=True) for gc_id in expired_gc_ids]
+        updates = []
+        # Update 'Y' for expired gcIds
+        if expired_gc_ids:
+            updates.extend([
+                UpdateOne({"gcId": gc_id}, {"$set": {"ret_policies_expired": "Y"}}, upsert=True)
+                for gc_id in expired_gc_ids
+            ])
+        # Update 'N' for active gcIds
+        if active_gc_ids:
+            updates.extend([
+                UpdateOne({"gcId": gc_id}, {"$set": {"ret_policies_expired": "N"}}, upsert=True)
+                for gc_id in active_gc_ids
+            ])
+        # Perform bulk write
         result = temp_collection.bulk_write(updates)
-        logging.info("Bulk upsert completed: %d matched, %d modified, %d upserted.", result.matched_count, result.modified_count, result.upserted_count)
+        logging.info("Bulk upsert completed: %d matched, %d modified, %d upserted.",
+                     result.matched_count, result.modified_count, result.upserted_count)
     except Exception as e:
         logging.error("Failed to perform bulk upsert on temp collection: %s", e)
         raise
 
+
 @retry_on_failure
-def update_tracking_status(last_id, processed_count, expired_count):
+def update_tracking_status(last_id, processed_count, expired_count, active_count, status="in_progress"):
     try:
         tracking_collection.update_one(
             {"script_name": "retention_policy_evaluation"},
@@ -216,45 +275,59 @@ def update_tracking_status(last_id, processed_count, expired_count):
                 "last_id": last_id,
                 "processed_count": processed_count,
                 "expired_count": expired_count,
+                "active_count": active_count,
                 "timestamp": datetime.now(tz=timezone.utc),
-                "status": "in_progress"
+                "status": status
             }},
             upsert=True
         )
-        logging.info("Tracking status updated with last_id: %s, processed_count: %d, expired_count: %d",
-                     last_id, processed_count, expired_count)
+        logging.info(
+            "Tracking status updated: last_id: %s, evaluated: %d, expired: %d, active: %d, status: %s",
+            last_id, processed_count, expired_count, active_count, status
+        )
     except Exception as e:
         logging.error("Failed to update tracking status: %s", e)
         raise
 
+
 def evaluate_and_update_batch(gc_id_list, policy_expiry_thresholds):
-    expired_gc_ids = evaluate_policies_for_gcids(gc_id_list, policy_expiry_thresholds)
-    update_temp_collection(expired_gc_ids)
-    return expired_gc_ids
+    expired_gc_ids, active_gc_ids = evaluate_policies_for_gcids(gc_id_list, policy_expiry_thresholds)
+    update_temp_collection(expired_gc_ids, active_gc_ids)
+    return len(gc_id_list), len(expired_gc_ids), len(active_gc_ids)
+
 
 def process_gcids_in_batches(policy_expiry_thresholds):
-    processing_status, last_id, total_evaluated, total_expired = get_tracking_status()
+
+    def get_parent_script_status():
+        # Function to check the status of the parent script "unique_gcid"
+        parent_status_record = tracking_collection.find_one({"script_name": "unique_gcid"})
+        return parent_status_record.get("status", "not_started") if parent_status_record else "not_started"
+
+    # Retrieve tracking status
+    processing_status, last_id, total_evaluated, total_expired, total_active = get_tracking_status()
     previous_last_id = last_id
     previous_total_evaluated = total_evaluated
     previous_total_expired = total_expired
-
+    previous_total_active = total_active
     while not shutdown_flag:
         previous_last_id = last_id
         previous_total_evaluated = total_evaluated
         previous_total_expired = total_expired
+        previous_total_active = total_active
+        # Fetch a large batch of gcIds
         large_gc_id_batch = fetch_gc_id_batch(last_id)
-        if not large_gc_id_batch and processing_status == "complete":
+        if not large_gc_id_batch and get_parent_script_status() == "complete":
             logging.info("All gcIds processed, and tracking status is 'complete'. Exiting.")
             break
-
         if large_gc_id_batch:
             last_id = large_gc_id_batch[-1]["_id"]
             gc_id_list = [doc["gcId"] for doc in large_gc_id_batch]
             logging.info("Fetched a large batch of %d gcIds for processing.", len(gc_id_list))
-
+            # Batch-specific metrics
             batch_evaluated = 0
             batch_expired = 0
-
+            batch_active = 0
+            # Process batches using threads
             with ThreadPoolExecutor(max_workers=gcid_eval_max_threads) as executor:
                 futures = []
                 for i in range(0, len(gc_id_list), gcid_eval_batch_size):
@@ -263,32 +336,34 @@ def process_gcids_in_batches(policy_expiry_thresholds):
                         break
                     gcid_eval_batch = gc_id_list[i:i + gcid_eval_batch_size]
                     futures.append(executor.submit(evaluate_and_update_batch, gcid_eval_batch, policy_expiry_thresholds))
-
                 for completed_future in as_completed(futures):
                     try:
                         if shutdown_flag:
                             logging.info("Terminating batch processing due to shutdown signal.")
                             break
-                        expired_gc_ids = completed_future.result()
-                        batch_evaluated += len(gcid_eval_batch)
-                        batch_expired += len(expired_gc_ids)
+                        evaluated_count, expired_count, active_count = completed_future.result()
+                        batch_evaluated += evaluated_count
+                        batch_expired += expired_count
+                        batch_active += active_count
                     except Exception as e:
                         logging.error("An error occurred while processing a batch: %s", e)
-
+            # Update totals
             total_evaluated += batch_evaluated
             total_expired += batch_expired
-            update_tracking_status(last_id, total_evaluated, total_expired)
-            logging.info("Updated tracking for processed gcIds. Total evaluated: %d, total expired: %d", total_evaluated, total_expired)
+            total_active += batch_active
+            # Update tracking collection
+            update_tracking_status(last_id, total_evaluated, total_expired, total_active)
+            logging.info("Batch processed: Evaluated: %d, Expired: %d, Active: %d", batch_evaluated, batch_expired, batch_active)
+            logging.info("Total so far: Evaluated: %d, Expired: %d, Active: %d", total_evaluated, total_expired, total_active)
         else:
             time.sleep(60)
-
+    # Final tracking update
     if shutdown_flag:
         logging.info("Process interrupted by shutdown signal. Exiting gracefully.")
-        update_tracking_status(previous_last_id, previous_total_evaluated, previous_total_expired, status="interrupted")
+        update_tracking_status(previous_last_id, previous_total_evaluated, previous_total_expired, previous_total_active, status="interrupted")
     else:
         logging.info("Batch processing completed successfully.")
-        update_tracking_status(last_id, processed_count=total_evaluated, expired_count=total_expired, status="complete")
-
+        update_tracking_status(last_id, total_evaluated, total_expired, total_active, status="complete")
 
 try:
     logging.info("Retrieving retention policies from MongoDB...")
@@ -297,9 +372,8 @@ try:
         {"policyId": 1, "retentionPeriod": 1, "unitOfPeriod": 1, "_id": 0}
     ))
     logging.info("Total retention policies retrieved: %d", len(retention_policies))
-
     policy_expiry_thresholds = {policy["policyId"]: get_filter(policy) for policy in retention_policies}
-    logging.info("Computed policy expiration thresholds.")
+    logging.info("Computed retention policy expiration thresholds.")
 
     process_gcids_in_batches(policy_expiry_thresholds)
 
