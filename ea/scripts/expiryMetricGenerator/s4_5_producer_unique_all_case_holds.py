@@ -2,7 +2,7 @@ import argparse
 import logging
 import signal
 import time
-from pymongo import MongoClient, errors, UpdateOne
+from pymongo import MongoClient, errors, UpdateOne, WriteConcern
 from datetime import datetime, timezone
 from functools import wraps
 from config_loader import load_and_configure
@@ -55,8 +55,10 @@ signal.signal(signal.SIGTERM, handle_signal)
 def connect_to_mongo():
     while not shutdown_flag:
         try:
+            uri = mongo_config["site_uri"]
             client = MongoClient(
-                mongo_config["site_uri"],
+                uri,
+                readPreference="secondary",  # Read from secondary
                 serverSelectionTimeoutMS=mongo_config["connection_timeout"],
                 socketTimeoutMS=mongo_config["socket_timeout"]
             )
@@ -76,13 +78,16 @@ client = connect_to_mongo()
 tenant_db = client[mongo_config["tenant"]]
 case_collection = tenant_db["case_items"]
 temp_collection_name = runtime_config.get("temp_collection")
-temp_collection = tenant_db[temp_collection_name]
+temp_collection = tenant_db.get_collection(
+    temp_collection_name,
+    write_concern=WriteConcern(w=1)
+)
 tracking_collection = tenant_db[f"{temp_collection_name}_tracking"]
 
 case_fetch_batch_size = app_settings.get("case_fetch_batch_size", 10000)
 
 @retry_on_failure()
-def ensure_index_on_gcId():
+def ensure_index_on_gcid():
     indexes = temp_collection.list_indexes()
     index_exists = any(index['key'] == {'gcId': 1} for index in indexes)
     if not index_exists:
@@ -90,7 +95,7 @@ def ensure_index_on_gcId():
         logging.info("Created unique index on 'gcId' for collection: %s", temp_collection_name)
     else:
         logging.info("Index on 'gcId' already exists in collection: %s", temp_collection_name)
-ensure_index_on_gcId()
+ensure_index_on_gcid()
 
 # Functions to manage last_id and script status in the tracking collection
 def get_tracking_status():

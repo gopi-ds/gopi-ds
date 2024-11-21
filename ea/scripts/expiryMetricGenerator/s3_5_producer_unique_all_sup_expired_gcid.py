@@ -3,7 +3,7 @@ import logging
 import signal
 import time
 from datetime import datetime, timezone, timedelta
-from pymongo import MongoClient, UpdateOne, errors
+from pymongo import MongoClient, UpdateOne, errors, WriteConcern
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config_loader import load_and_configure
 import dateutil.parser
@@ -39,8 +39,10 @@ def connect_to_mongo():
     """Attempts to connect to MongoDB with indefinite retries on failure."""
     while not shutdown_flag:
         try:
+            uri = mongo_config["site_uri"]
             client = MongoClient(
-                mongo_config["site_uri"],
+                uri,
+                readPreference="secondary",  # Read from secondary
                 serverSelectionTimeoutMS=mongo_config["connection_timeout"],
                 socketTimeoutMS=mongo_config["socket_timeout"]
             )
@@ -59,7 +61,10 @@ client = connect_to_mongo()
 tenant_db = client[mongo_config["tenant"]]
 rpm_collection = tenant_db["retention_policy_map"]
 temp_collection_name = runtime_config.get("temp_collection")
-temp_collection = tenant_db[temp_collection_name]
+temp_collection = tenant_db.get_collection(
+    temp_collection_name,
+    write_concern=WriteConcern(w=1)
+)
 tracking_collection = tenant_db[f"{temp_collection_name}_tracking"]
 rpoll_coll = tenant_db['retention_policies']
 effective_instant_str = app_settings.get("EFFECTIVE_INSTANT")
