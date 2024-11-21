@@ -2,7 +2,7 @@ import argparse
 import logging
 import signal
 import time
-from pymongo import MongoClient, errors
+from pymongo import MongoClient, errors, WriteConcern
 from datetime import datetime, timezone
 from functools import wraps
 from config_loader import load_and_configure
@@ -53,11 +53,15 @@ signal.signal(signal.SIGTERM, handle_signal)
 def connect_to_mongo():
     """Attempts to connect to MongoDB with retries on failure."""
     uri = mongo_config["site_uri"]
-    client = MongoClient(uri, serverSelectionTimeoutMS=mongo_config["connection_timeout"], socketTimeoutMS=mongo_config["socket_timeout"])
+    client = MongoClient(
+        uri,
+        readPreference="secondary",  # Read from secondary
+        serverSelectionTimeoutMS=mongo_config["connection_timeout"],
+        socketTimeoutMS=mongo_config["socket_timeout"]
+    )
     client.admin.command('ping')  # Test connection
     logging.info("Connected to MongoDB successfully.")
     return client
-
 client = connect_to_mongo()
 
 tenant_db = client[mongo_config["tenant"]]
@@ -65,11 +69,15 @@ rpm_collection = tenant_db["retention_policy_map"]
 
 # Determine or create the temporary and tracking collections
 temp_collection_name = runtime_config.get("temp_collection") or f"temp_unique_gcid_{int(time.time())}"
-temp_collection = tenant_db[temp_collection_name]
+temp_collection = tenant_db.get_collection(
+    temp_collection_name,
+    write_concern=WriteConcern(w=1)
+)
 tracking_collection = tenant_db[f"{temp_collection_name}_tracking"]
 
+
 @retry_on_failure()
-def ensure_index_on_gcId():
+def ensure_index_on_gcid():
     """Ensures an index on 'gcId' exists in the temporary collection."""
     indexes = temp_collection.list_indexes()
     index_exists = any(index['key'] == {'gcId': 1} for index in indexes)
@@ -81,7 +89,7 @@ def ensure_index_on_gcId():
         logging.info("Index on 'gcId' already exists in collection: %s", temp_collection_name)
 
 # Call to ensure index on 'gcId' after defining `temp_collection`
-ensure_index_on_gcId()
+ensure_index_on_gcid()
 
 # Functions to manage last_id and script status in the tracking collection
 def get_last_processed_id():
