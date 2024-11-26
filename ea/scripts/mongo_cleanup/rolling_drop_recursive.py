@@ -1,9 +1,26 @@
+import argparse
 import datetime
 import json
 import logging
 import time
 from pymongo.errors import OperationFailure
 from setup import initialize_logging, initialize_mongo_connection
+
+
+def parse_arguments():
+    """
+    Parses command-line arguments to retrieve the configuration file path.
+
+    Returns:
+        Namespace: Parsed command-line arguments.
+    """
+    parser = argparse.ArgumentParser(description="Rolling Drop Script for MongoDB")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to the JSON configuration file."
+    )
+    return parser.parse_args()
 
 
 # Function to read configuration from a JSON file
@@ -22,32 +39,6 @@ def read_config(config_file):
     except Exception as e:
         print(f"Error loading config file: {e}")
         raise
-
-
-# Read configuration from the config file (provide the correct path)
-config = read_config('../config/rollingDrop.json')  # Specify the path to your config file
-
-# MongoDB connection details from the config file
-mongo_uri = config['mongo_uri']
-tenant_db_name = config['tenant_db_name']
-config_db_name = config['config_db_name']
-alcatraz_db_name = config['alcatraz_db_name']
-status_tracking_collection_name = f"{tenant_db_name}_status_tracking"
-log_file = config['log_file']
-log_level_str = config['log_level']
-DRY_RUN = config.get('dry_run', True)
-deletes_per_batch = config.get('deletes_per_batch', 10000)
-concurrent_deletion_enabled = config.get('concurrent_deletion_enabled', False)
-write_concern = config.get("writeConcern", {"w": "majority", "j": True})
-
-# Initialize logging and MongoDB connection using setup.py functions
-initialize_logging(log_file, log_level_str)
-tenantdb = initialize_mongo_connection(mongo_uri, tenant_db_name)
-configdb = initialize_mongo_connection(mongo_uri, config_db_name)
-alcatrazdb = initialize_mongo_connection(mongo_uri, alcatraz_db_name)
-
-# Track the status of each collection (name, type, status)
-collection_status = []
 
 
 def log_banner():
@@ -556,24 +547,46 @@ if __name__ == "__main__":
     """
     Main entry point for the script.
 
-    Executes the rolling drop process for all collections in the tenant database. Logs:
-        - Start and end of the process.
-        - Whether the operation was a dry run or actual deletion.
-        - Total elapsed time in hours, minutes, and seconds.
-
-    Steps:
-        1. Log the start of the process.
-        2. Call `perform_rolling_drop_for_all_collections` to handle deletions.
-        3. Measure and log total execution time.
-        4. Log completion.
-
+    Reads the configuration file provided via the command-line parameter, initializes connections and logging,
+    and starts the rolling drop process.
     """
+    # Parse command-line arguments
+    args = parse_arguments()
+    config_file = args.config
+
+    # Read the configuration file
+    config = read_config(config_file)
+
+    # MongoDB connection details from the config file
+    mongo_uri = config['mongo_uri']
+    tenant_db_name = config['tenant_db_name']
+    config_db_name = config['config_db_name']
+    alcatraz_db_name = config['alcatraz_db_name']
+    status_tracking_collection_name = f"{tenant_db_name}_status_tracking"
+    log_file = config['log_file']
+    log_level_str = config['log_level']
+    DRY_RUN = config.get('dry_run', True)
+    deletes_per_batch = config.get('deletes_per_batch', 10000)
+    concurrent_deletion_enabled = config.get('concurrent_deletion_enabled', False)
+    write_concern = config.get("writeConcern", {"w": "majority", "j": True})
+
+    # Initialize logging and MongoDB connection using setup.py functions
+    initialize_logging(log_file, log_level_str)
+    tenantdb = initialize_mongo_connection(mongo_uri, tenant_db_name)
+    configdb = initialize_mongo_connection(mongo_uri, config_db_name)
+    alcatrazdb = initialize_mongo_connection(mongo_uri, alcatraz_db_name)
+
+    # Log the start of the process
     start_time = time.time()
-
     logging.info(f"Starting recursive rolling drop for all collections (Dry run: {DRY_RUN})")
-    perform_rolling_drop_for_all_collections()
-    logging.info(f"Recursive rolling drop completed for all collections (Dry run: {DRY_RUN})")
 
+    # Perform the rolling drop
+    try:
+        perform_rolling_drop_for_all_collections()
+    except Exception as e:
+        logging.error(f"Error during rolling drop: {e}")
+
+    # Log the end of the process
     end_time = time.time()
     elapsed_time = end_time - start_time
     hours, rem = divmod(elapsed_time, 3600)

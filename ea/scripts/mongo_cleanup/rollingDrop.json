@@ -1,0 +1,12 @@
+{
+  "mongo_uri": "mongodb://adminUser2:strongAdminPassword@localhost:27017",
+  "tenant_db_name": "sanity1k8s",
+  "config_db_name": "config",
+  "alcatraz_db_name": "alcatraz",
+  "log_file": "C:\\ea-Smarsh\\src\\gopi-ds-expedite\\ea\\scripts\\mongo_cleanup\\rolling_drop_1.log",
+  "log_level": "INFO",
+  "dry_run": true,
+  "deletes_per_batch": 10000,
+  "concurrent_deletion_enabled": true,
+  "writeConcern": {"w": "majority", "j": true, "wtimeout": 60000}
+}
