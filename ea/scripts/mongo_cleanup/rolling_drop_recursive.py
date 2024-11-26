@@ -562,7 +562,7 @@ if __name__ == "__main__":
     tenant_db_name = config['tenant_db_name']
     config_db_name = config['config_db_name']
     alcatraz_db_name = config['alcatraz_db_name']
-    status_tracking_collection_name = f"{tenant_db_name}_status_tracking"
+    status_tracking_collection_name = f"{tenant_db_name}_decomm_status_tracking"
     log_file = config['log_file']
     log_level_str = config['log_level']
     DRY_RUN = config.get('dry_run', True)
