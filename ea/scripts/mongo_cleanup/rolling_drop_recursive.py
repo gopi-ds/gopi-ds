@@ -1,44 +1,20 @@
-# Summary
-#       - Configuration: The script reads from a JSON configuration file and
-#                       initializes MongoDB connections, log settings, and other options.
-#       - Sharded and Unsharded Collections: Collections are categorized as either sharded
-#                       or unsharded, and different drop logic is applied accordingly.
-#       - Dry Run: If the dry_run option is enabled,
-#                   operations are simulated, and no actual data is modified.
-#       - Concurrent and Sequential Deletions: For sharded collections,
-#                   deletions can occur either concurrently or sequentially,
-#                   depending on the configuration.
-#       - Write Concern: MongoDB operations are performed with a specified writeConcern,
-#                   ensuring proper replication and journaling behavior.
-#       - Summary Logging: A summary of the operations (success or failure) is logged at the end.
-
-# Sample config format
-#   {
-#       "mongo_uri": "mongodb://admin@localhost:37018",
-#       "db_name": "testDatabase",
-#       "config_db_name": "config",
-#       "log_file": "C:\\rolling_drop.log",
-#       "log_level": "INFO",
-#       "dry_run": true,
-#       "deletes_per_batch": 10000,
-#       "concurrent_deletion_enabled": true,
-#       "writeConcern": {"w": "majority", "j": true, "wtimeout": 60000}
-#   }
-
-
 import datetime
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tabulate import tabulate
+from pymongo.errors import OperationFailure
 from setup import initialize_logging, initialize_mongo_connection
 
 
 # Function to read configuration from a JSON file
-# This function loads the configuration file containing MongoDB settings,
-# log file paths, and other options.
 def read_config(config_file):
+    """
+    Reads configuration from a JSON file.
+
+    :param config_file: Path to the JSON configuration file.
+    :return: Dictionary containing configuration data.
+    :raises: Exception if the file cannot be read or parsed.
+    """
     try:
         with open(config_file, 'r') as file:
             config_data = json.load(file)
@@ -47,334 +23,561 @@ def read_config(config_file):
         print(f"Error loading config file: {e}")
         raise
 
+
 # Read configuration from the config file (provide the correct path)
 config = read_config('../config/rollingDrop.json')  # Specify the path to your config file
 
 # MongoDB connection details from the config file
 mongo_uri = config['mongo_uri']
-db_name = config['db_name']
+tenant_db_name = config['tenant_db_name']
 config_db_name = config['config_db_name']
-log_file = config['log_file']  # Read log file location from config
-log_level_str = config['log_level']  # Read log level from config
-DRY_RUN = config.get('dry_run', True)  # Read dry_run from config
-deletes_per_batch= config.get('deletes_per_batch', 10000)  # Read batch size in number of documents
-concurrent_deletion_enabled = config.get('concurrent_deletion_enabled', False)  # Toggle for concurrent execution
+alcatraz_db_name = config['alcatraz_db_name']
+status_tracking_collection_name = f"{tenant_db_name}_status_tracking"
+log_file = config['log_file']
+log_level_str = config['log_level']
+DRY_RUN = config.get('dry_run', True)
+deletes_per_batch = config.get('deletes_per_batch', 10000)
+concurrent_deletion_enabled = config.get('concurrent_deletion_enabled', False)
 write_concern = config.get("writeConcern", {"w": "majority", "j": True})
 
 # Initialize logging and MongoDB connection using setup.py functions
 initialize_logging(log_file, log_level_str)
-tenantdb = initialize_mongo_connection(mongo_uri, db_name)
+tenantdb = initialize_mongo_connection(mongo_uri, tenant_db_name)
 configdb = initialize_mongo_connection(mongo_uri, config_db_name)
+alcatrazdb = initialize_mongo_connection(mongo_uri, alcatraz_db_name)
 
 # Track the status of each collection (name, type, status)
 collection_status = []
 
-# Banner text to indicate the start of the program execution
+
 def log_banner():
-    logging.info("="*50)
+    """
+    Logs a banner message to indicate the start of the program.
+    """
+    logging.info("=" * 50)
     logging.info(f"Starting Rolling Drop Program at {datetime.datetime.now()}")
-    logging.info("="*50)
+    logging.info("=" * 50)
 
-# Call the banner logging function
-log_banner()
 
-# Function to get sharded and unsharded collections
-# Fetches the collections from the MongoDB instance and categorizes them into sharded or unsharded collections.
+def is_hashed_shard_key(db_name, collection_name, config_db):
+    """
+    Determines if a collection's shard key is hashed.
+
+    This function retrieves the shard key metadata for a collection from the
+    config database and checks if any part of the shard key is of type "hashed."
+    Logs a warning and returns False if metadata retrieval fails.
+
+    Args:
+        db_name (str): Name of the database.
+        collection_name (str): Name of the collection.
+        config_db (pymongo.database.Database): Connection to the config database.
+
+    Returns:
+        bool: True if the shard key is hashed, False otherwise.
+    """
+    try:
+        namespace = f"{db_name}.{collection_name}"
+        collection_metadata = config_db["collections"].find_one({"_id": namespace})
+        if not collection_metadata:
+            logging.warning(f"Metadata for collection {namespace} not found in config.collections. Assuming non-hashed.")
+            return False
+        shard_key = collection_metadata.get("key", {})
+        return any(value == "hashed" for value in shard_key.values())
+    except Exception as e:
+        logging.warning(f"Error checking shard key type for {collection_name}: {e}. Assuming non-hashed.")
+        return False
+
+
+def retry_on_failure_infinite(delay=5, backoff=1):
+    """
+    Decorator to retry a function infinitely until it succeeds.
+
+    Includes an exponential backoff for delays between retries.
+
+    :param delay: Initial delay between retries in seconds.
+    :param backoff: Multiplier for exponential backoff.
+    :return: Decorated function with retry logic.
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            current_delay = delay
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    logging.warning(f"Attempt {attempt}: Function {func.__name__} failed with error: {e}")
+                    logging.info(f"Retrying after {current_delay} seconds...")
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+        return wrapper
+    return decorator
+
+
+def is_rebalancing(config_db):
+    """
+    Checks if any chunk migrations (rebalancing) are currently in progress.
+
+    :param config_db: Config database connection object.
+    :return: True if rebalancing is detected, False otherwise.
+    :raises: OperationFailure if the currentOp command fails.
+    """
+    try:
+        active_migrations = config_db.command("currentOp", {"active": True, "desc": "chunk migration"})
+        in_progress_operations = active_migrations.get("inprog", [])
+        if in_progress_operations:
+            logging.info(f"Rebalancing detected: {len(in_progress_operations)} operations in progress.")
+            return True
+        logging.info("No rebalancing operations currently in progress.")
+        return False
+    except OperationFailure as e:
+        logging.error(f"Failed to check rebalancing status: {e}")
+        raise
+
+
+def wait_for_rebalancing_to_complete(config_db, check_interval=300):
+    """
+    Pauses the script if rebalancing is detected and waits until it completes.
+
+    :param config_db: Config database connection object.
+    :param check_interval: Time in seconds to wait before rechecking.
+    """
+    while is_rebalancing(config_db):
+        logging.warning(f"Rebalancing in progress. Pausing for {check_interval} seconds...")
+        time.sleep(check_interval)
+    logging.info("Rebalancing completed. Resuming operations.")
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def delete_with_range_key(collection, shard_key, min_key, max_key, write_concern, dry_run):
+    """
+    Deletes documents in a range defined by the shard key.
+
+    :param collection: MongoDB collection object.
+    :param shard_key: The shard key for deletion.
+    :param min_key: Minimum value of the range.
+    :param max_key: Maximum value of the range.
+    :param write_concern: Write concern configuration.
+    :param dry_run: If True, simulates deletion without actual changes.
+    :return: Number of documents deleted (0 if dry_run is True).
+    """
+    query = {shard_key: {"$gte": min_key[shard_key], "$lt": max_key[shard_key]}}
+    if dry_run:
+        logging.info(f"DRY RUN: Would have deleted documents with range query: {query}")
+        return 0
+    else:
+        result = collection.delete_many(query, writeConcern=write_concern)
+        logging.info(f"Deleted {result.deleted_count} documents using range key query: {query}")
+        return result.deleted_count
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def delete_with_hashed_key(collection, shard_key, min_key, max_key, write_concern, dry_run):
+    query = {shard_key: {"$gte": min_key[shard_key], "$lt": max_key[shard_key]}}
+    if dry_run:
+        logging.info(f"DRY RUN: Would have deleted documents with hashed query: {query}")
+        return 0
+    else:
+        result = collection.delete_many(query, writeConcern=write_concern)
+        logging.info(f"Deleted {result.deleted_count} documents using hashed key query: {query}")
+        return result.deleted_count
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def delete_with_full_scan(collection, batch_size, write_concern, dry_run, delay_between_batches=0):
+    """
+    Deletes documents from a collection in batches or simulates deletion in DRY_RUN mode.
+
+    :param collection: MongoDB collection object.
+    :param batch_size: Number of documents to delete in each batch.
+    :param write_concern: Write concern configuration.
+    :param dry_run: If True, simulates deletion without actual changes.
+    :param delay_between_batches: Optional delay between batch deletions in seconds.
+    :return: Total number of documents deleted.
+    """
+    remaining_docs = collection.count_documents({})
+    total_deleted = 0
+    logging.info(f"Starting full scan deletion for collection '{collection.name}' with {remaining_docs} documents.")
+    while remaining_docs > 0:
+        delete_count = min(batch_size, remaining_docs)
+        if dry_run:
+            logging.info(f"DRY RUN: Would have deleted {delete_count} documents in this batch.")
+            total_deleted += delete_count
+        else:
+            result = collection.delete_many({}, limit=delete_count, writeConcern=write_concern)
+            total_deleted += result.deleted_count
+            logging.info(f"Deleted {result.deleted_count} documents in this batch.")
+        remaining_docs -= delete_count
+        logging.info(f"Remaining documents: {remaining_docs}. Total deleted: {total_deleted}")
+        if delay_between_batches > 0:
+            time.sleep(delay_between_batches)
+    logging.info(f"Full scan deletion completed for collection '{collection.name}'. Total deleted: {total_deleted}")
+    return total_deleted
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def initialize_collection_status(collection_name, shard, total_chunks, total_documents):
+    """
+    Initializes or updates the status of a collection or shard in the status tracking collection.
+
+    Args:
+        collection_name (str): The name of the collection being processed.
+        shard (str or None): The name of the shard (use None for unsharded collections).
+        total_chunks (int): Total number of chunks to process.
+        total_documents (int): Estimated total documents in the collection/shard.
+
+    Returns:
+        None
+    """
+    status_doc = {
+        "collection_name": collection_name,
+        "shard": shard,
+        "status": "pending",
+        "total_documents": total_documents,
+        "total_deleted": 0,
+        "chunks_processed": 0,
+        "total_chunks": total_chunks,
+        "last_processed_chunk": None,
+        "last_updated": datetime.datetime.now(),
+        "error": None
+    }
+    alcatrazdb[status_tracking_collection_name].update_one(
+        {"collection_name": collection_name, "shard": shard},
+        {"$set": status_doc},
+        upsert=True
+    )
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def update_collection_status(collection_name, shard, chunks_processed, total_deleted, last_processed_chunk, status="in_progress", error=None):
+    """
+    Updates the status of a collection or shard in the status tracking collection.
+
+    Args:
+        collection_name (str): The name of the collection being processed.
+        shard (str or None): The name of the shard (use None for unsharded collections).
+        chunks_processed (int): The number of chunks processed so far.
+        total_deleted (int): The total number of documents deleted so far.
+        last_processed_chunk (dict or None): Information about the last processed chunk.
+        status (str, optional): Current status of the process ("in_progress", "completed", "failed"). Defaults to "in_progress".
+        error (str, optional): Error message if the status is "failed". Defaults to None.
+
+    Returns:
+        None
+    """
+    alcatrazdb[status_tracking_collection_name].update_one(
+        {"collection_name": collection_name, "shard": shard},
+        {
+            "$set": {
+                "status": status,
+                "chunks_processed": chunks_processed,
+                "total_deleted": total_deleted,
+                "last_processed_chunk": last_processed_chunk,
+                "last_updated": datetime.datetime.now(),
+                "error": error
+            }
+        }
+    )
+
+
+def get_collection_status(collection_name, shard):
+    """
+    Retrieves the current status of a collection or shard from the status tracking collection.
+
+    Args:
+        collection_name (str): The name of the collection whose status is being retrieved.
+        shard (str or None): The name of the shard (use None for unsharded collections).
+
+    Returns:
+        dict or None: The status document if found, or None if no matching document exists.
+    """
+    return alcatrazdb[status_tracking_collection_name].find_one({"collection_name": collection_name, "shard": shard})
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def delete_from_shard(shard, chunks, collection_name, is_hashed=False):
+    """
+    Deletes documents from a specific shard by processing its chunks.
+
+    This method processes chunks sequentially, tracking the deletion progress and
+    handling resumable state using the status tracking collection.
+
+    Args:
+        shard (str): The name of the shard being processed.
+        chunks (list): List of chunk metadata for the shard.
+        collection_name (str): Name of the collection being processed.
+        is_hashed (bool, optional): Whether the shard key is hashed. Defaults to False.
+
+    Returns:
+        None
+    """
+    collection = tenantdb[collection_name]
+    total_chunks = len(chunks)
+    # Count total documents in the collection (if not already initialized)
+    total_documents = collection.estimated_document_count()
+    # Initialize status tracking
+    initialize_collection_status(collection_name, shard, total_chunks, total_documents)
+    # Retrieve last saved state for resumption
+    status = get_collection_status(collection_name, shard)
+    chunks_processed = status.get("chunks_processed", 0)
+    total_deleted = status.get("total_deleted", 0)
+    # Resume from the last processed chunk
+    for i, chunk in enumerate(chunks[chunks_processed:], start=chunks_processed + 1):
+        min_key = chunk['minKey']
+        max_key = chunk['maxKey']
+        shard_key = list(min_key.keys())[0]
+        try:
+            # Wait for rebalancing to complete before processing this chunk
+            wait_for_rebalancing_to_complete(configdb)
+            remaining_docs = chunk['document_count']
+            while remaining_docs > 0:
+                if is_hashed:
+                    deleted = delete_with_hashed_key(collection, shard_key, min_key, max_key, write_concern, DRY_RUN)
+                else:
+                    deleted = delete_with_range_key(collection, shard_key, min_key, max_key, write_concern, DRY_RUN)
+                remaining_docs -= deleted
+                total_deleted += deleted
+            # Update status after processing the chunk
+            update_collection_status(
+                collection_name, shard, i, total_deleted, last_processed_chunk=chunk
+            )
+        except Exception as e:
+            logging.error(f"Error processing chunk {i}/{total_chunks} in shard {shard}: {e}")
+            update_collection_status(
+                collection_name, shard, i, total_deleted, last_processed_chunk=chunk, status="failed", error=str(e)
+            )
+    # Mark shard as completed
+    update_collection_status(collection_name, shard, total_chunks, total_deleted, last_processed_chunk=None, status="completed")
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def all_chunk_info(ns, estimate=True):
+    """
+    Gathers chunk information for a given namespace (ns) before the rolling drop process.
+
+    This function logs the data in a tabular format for better understanding, converts chunk size
+    to MB for readability, and provides consolidated totals for chunk size and object count.
+
+    Args:
+        ns (str): Namespace in the format "database.collection".
+        estimate (bool): If True, the `datasize` command uses estimates.
+
+    Returns:
+        dict: A dictionary mapping each shard to its chunk data. Returns an empty dictionary if an error occurs.
+    """
+    try:
+        # Fetch all chunks for the specified namespace from the config server
+        chunks = configdb.chunks.find({"ns": ns}).sort("min", 1)
+        # Fetch collection metadata to determine the shard key
+        collection_metadata = configdb.collections.find_one({"_id": ns})
+        if not collection_metadata:
+            logging.warning(f"No metadata found for namespace {ns}")
+            return {}
+        shard_key = collection_metadata.get("key")
+        if not shard_key:
+            logging.warning(f"Shard key not found for namespace {ns}")
+            return {}
+        # Initialize the shard map for organizing chunk data
+        shard_map = {}
+        # Initialize totals for consolidated size and document count
+        total_size_mb = 0
+        total_objects = 0
+        # Prepare data for tabular output
+        chunk_info_list = []
+        for chunk in chunks:
+            shard = chunk["shard"]
+            min_key = chunk["min"]
+            max_key = chunk["max"]
+            # Command to estimate the chunk size and number of objects
+            data_size_cmd = {
+                "datasize": ns,
+                "keyPattern": shard_key,
+                "min": min_key,
+                "max": max_key,
+                "estimate": estimate
+            }
+            # Fetch data size details for the chunk
+            try:
+                data_size_result = tenantdb.command(data_size_cmd)
+            except OperationFailure as e:
+                logging.warning(f"Failed to fetch datasize for chunk {chunk['_id']}: {e}")
+                continue
+            # Convert size to MB
+            chunk_size_mb = data_size_result["size"] / (1024 * 1024)
+            document_count = data_size_result["numObjects"]
+            # Update the shard map
+            if shard not in shard_map:
+                shard_map[shard] = []
+            shard_map[shard].append({
+                "chunk_id": chunk["_id"],
+                "minKey": min_key,
+                "maxKey": max_key,
+                "size_mb": f"{chunk_size_mb:.2f} MB",
+                "document_count": document_count
+            })
+            # Add chunk information to the table
+            chunk_info_list.append([
+                shard, chunk["_id"], min_key, max_key, f"{chunk_size_mb:.2f} MB", document_count
+            ])
+            # Update totals
+            total_size_mb += chunk_size_mb
+            total_objects += document_count
+        # Log the consolidated chunk information
+        from tabulate import tabulate
+        headers = ["Shard", "Chunk ID", "Min Key", "Max Key", "Chunk Size (MB)", "Objects in Chunk"]
+        logging.info(f"Summary for collection {ns}\n"
+                     f"Consolidated size: {total_size_mb:.2f} MB\n"
+                     f"Consolidated object count: {total_objects}\n"
+                     + tabulate(chunk_info_list, headers=headers, tablefmt="grid"))
+
+        return shard_map
+    except Exception as e:
+        logging.warning(f"Error retrieving chunk information for namespace {ns}: {e}. Returning empty shard map.")
+        return {}
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def process_sharded_collection(collection_name):
+    """
+    Processes a sharded collection by deleting documents chunk by chunk across all its shards.
+
+    This method retrieves shard and chunk metadata, determines if the shard key is hashed,
+    and invokes `delete_from_shard` for each shard.
+
+    Args:
+        collection_name (str): Name of the sharded collection to process.
+
+    Returns:
+        None
+    """
+    shard_map = all_chunk_info(f"{tenant_db_name}.{collection_name}")
+    is_hashed = is_hashed_shard_key(tenant_db_name, collection_name, configdb)
+    for shard, chunks in shard_map.items():
+        total_deleted = delete_from_shard(shard, chunks, collection_name, is_hashed)
+        logging.info(f"Shard '{shard}': Total deleted documents: {total_deleted}")
+
+
+@retry_on_failure_infinite(delay=60, backoff=1)
+def process_unsharded_collection(collection_name):
+    """
+    Processes an unsharded collection by deleting all documents through a full scan.
+
+    Args:
+        collection_name (str): Name of the unsharded collection to process.
+
+    Returns:
+        None
+    """
+    delete_with_full_scan(tenantdb[collection_name], deletes_per_batch, write_concern, DRY_RUN)
+
+
 def get_sharded_unsharded_collections():
+    """
+    Categorizes collections in the tenant database into sharded and unsharded.
+
+    This method retrieves all collection names from the tenant database,
+    checks their shard status using the `collstats` command, and organizes them
+    into separate lists for sharded and unsharded collections.
+
+    Returns:
+        tuple: A tuple containing two lists:
+            - sharded_collections (list): Names of sharded collections.
+            - unsharded_collections (list): Names of unsharded collections.
+    """
     sharded_collections = []
     unsharded_collections = []
     all_collections = tenantdb.list_collection_names()
-
     for collection_name in all_collections:
         stats = tenantdb.command('collstats', collection_name)
         if stats.get('sharded', False):
             sharded_collections.append(collection_name)
         else:
             unsharded_collections.append(collection_name)
-
     return sharded_collections, unsharded_collections
 
-# Function to log the summary of success or failure at the end
-# Logs a summary table of the results for each collection processed during the rolling drop.
-def log_summary():
-    summary_table = tabulate(collection_status, headers=["Collection Name", "Shard", "Status"], tablefmt="grid")
-    logging.info("Processing summary\n" + summary_table)
 
-# Function to retrieve chunk information for sharded collections
-# Gathers chunk details from the config server for a given collection and logs the data in a tabular format.
-def all_chunk_info(ns, estimate=True):
-    """
-    This function gathers chunk information for a given namespace (ns)
-    before the rolling drop process and logs the data in a tabular format.
-    Chunk size is converted to MB for readability.
-    It also logs consolidated totals for the chunk size and the number of objects.
-
-    :param ns: Namespace in the format "database.collection"
-    :param estimate: Boolean, if True the datasize command uses estimates
-    :return: A dictionary mapping each shard to its chunk data
-    """
-    # Fetch all chunks for the specified namespace and sort by 'min'
-    chunks = configdb.chunks.find({"ns": ns}).sort("min", 1)
-
-    # Fetch the shard key only once for the namespace
-    collection_info = configdb.collections.find_one({"_id": ns})
-    if not collection_info:
-        logging.warning(f"Could not find collection info for namespace {ns}")
-        return {}
-
-    shard_key = collection_info["key"]
-
-    # Initialize the shard map to hold the data for each shard
-    shard_map = {}
-
-    # Initialize totals for size and object count
-    total_size_mb = 0
-    total_objects = 0
-
-    # Prepare a list to store chunk information for tabulate
-    chunk_info_list = []
-
-    # Iterate over each chunk
-    for chunk in chunks:
-        shard = chunk['shard']
-        min_key = chunk['min']
-        max_key = chunk['max']
-
-        # Run the datasize command to estimate the chunk size and number of objects
-        data_size_cmd = {
-            "datasize": chunk["ns"],
-            "keyPattern": shard_key,
-            "min": chunk["min"],
-            "max": chunk["max"],
-            "estimate": estimate
-        }
-
-        # Use the correct database reference here (assuming it's `db`)
-        data_size_result = tenantdb.command(data_size_cmd)
-
-        # Convert chunk size from bytes to MB
-        chunk_size_mb = data_size_result['size'] / (1024 * 1024)
-        document_count = data_size_result['numObjects']
-
-        # Add chunk data to the shard map
-        if shard not in shard_map:
-            shard_map[shard] = []
-
-        shard_map[shard].append({
-            "chunk_id": chunk["_id"],
-            "minKey": min_key,
-            "maxKey": max_key,
-            "size_mb": f"{chunk_size_mb:.2f} MB",
-            "document_count": document_count
-        })
-
-        # Append chunk data to list for tabular display, with Shard as the first column
-        chunk_info_list.append([
-            shard, chunk['_id'], min_key, max_key, f"{chunk_size_mb:.2f} MB", document_count
-        ])
-
-        # Update the totals
-        total_size_mb += chunk_size_mb
-        total_objects += document_count
-
-    # Log chunk information in a tabular format
-    headers = ["Shard", "Chunk ID", "Min Key", "Max Key", "Chunk Size (MB)", "Objects in Chunk"]
-    logging.info(f"Summary for collection {ns} \n"
-                 f"\t\t\t Consolidated size: {total_size_mb:.2f} MB\n"
-                 f"\t\t\t Consolidated object count: {total_objects}\n"
-                 + tabulate(chunk_info_list, headers=headers, tablefmt="grid"))
-
-    return shard_map
-
-# Function to delete documents from a shard
-# Deletes documents from chunks of a sharded collection, either concurrently or sequentially.
-def delete_from_shard(shard, chunks, collection_name):
-    try:
-        for chunk in chunks:
-            min_key = chunk['minKey']
-            max_key = chunk['maxKey']
-            shard_key = list(min_key.keys())[0]
-
-            remaining_docs = chunk['document_count']
-
-            while remaining_docs > 0:
-                # Calculate the actual batch size for this iteration
-                batch_size = min(deletes_per_batch, remaining_docs)
-
-                query = {shard_key: {"$gte": min_key[shard_key], "$lt": max_key[shard_key]}}
-                logging.info(f"Shard '{shard}': Executing delete query, batch size: {batch_size} documents")
-
-                if not DRY_RUN:
-                    try:
-                        result = tenantdb[collection_name].delete_many(query, limit=batch_size, writeConcern=write_concern)
-                        deleted_docs_count = result.deleted_count
-                        logging.info(f"Shard '{shard}': Deleted {deleted_docs_count} documents")
-                        # Update the remaining docs after processing this batch
-                        remaining_docs -= deleted_docs_count
-                    except Exception as e:
-                        logging.error(f"Shard '{shard}': Error deleting documents for collection {collection_name}: {e}")
-                        return False  # Return failure status
-                else:
-                    logging.info(f"DRY RUN: Shard '{shard}' would have executed delete query for {batch_size} documents with query: {query}")
-                    # Simulate batch progress
-                    remaining_docs -= batch_size
-
-        return True  # Return success status
-    except Exception as e:
-        logging.error(f"Shard '{shard}': Unexpected error during deletion: {e}")
-        return False  # Return failure status
-
-# Function to drop a sharded collection either concurrently or sequentially
-# Drops the sharded collection after deleting documents, with optional concurrent deletion.
-def drop_sharded_collection(collection_name):
-    """
-    Deletes documents from a sharded collection either concurrently across shards
-    or sequentially, based on the configuration.
-    """
-    logging.info(f"Starting rolling drop for sharded collection: {collection_name} (Dry run: {DRY_RUN})")
-
-    try:
-        # Step 1: Fetch chunk information for the collection
-        shard_map = {}
-        try:
-            # Call all_chunk_info to retrieve the shard map
-            shard_map = all_chunk_info(f"{db_name}.{collection_name}", estimate=True)
-            if not shard_map:
-                logging.warning(f"No chunks found for collection {collection_name}, treating as unsharded.")
-        except Exception as e:
-            logging.error(f"Error while fetching chunk information for collection {collection_name}: {e}")
-
-        # Step 2: Handle collections with no chunks (treat as unsharded)
-        if not shard_map:
-            try:
-                if not DRY_RUN:
-                    tenantdb[collection_name].drop(writeConcern=write_concern)
-                    logging.info(f"Unsharded collection {collection_name} dropped successfully")
-                    collection_status.append((collection_name, "Unsharded", "Success"))
-                else:
-                    logging.info(f"DRY RUN: Would have dropped unsharded collection: {collection_name}")
-                    collection_status.append((collection_name, "Unsharded", "Dry Run Success"))
-            except Exception as e:
-                logging.error(f"Error dropping unsharded collection {collection_name}: {e}")
-                collection_status.append((collection_name, "Unsharded", "Drop Error"))
-            return  # Exit after handling unsharded collection
-
-        # Step 3: Check if concurrent deletion is enabled
-        if concurrent_deletion_enabled:
-            logging.info("Concurrent deletion enabled. Deleting from shards concurrently...")
-            with ThreadPoolExecutor() as executor:  # No need for `concurrent_shards` value, use default workers
-                futures = {
-                    executor.submit(delete_from_shard, shard, chunks, collection_name): shard
-                    for shard, chunks in shard_map.items()
-                }
-
-                for future in as_completed(futures):
-                    shard = futures[future]
-                    try:
-                        success = future.result()
-                        if success:
-                            logging.info(f"Shard '{shard}': Successfully processed")
-                            collection_status.append((collection_name, shard, "Success"))
-                        else:
-                            logging.error(f"Shard '{shard}': Failed to process")
-                            collection_status.append((collection_name, shard, "Failed"))
-                    except Exception as e:
-                        logging.error(f"Shard '{shard}': Unexpected error: {e}")
-                        collection_status.append((collection_name, shard, "Unexpected Error"))
-        else:
-            logging.info("Concurrent deletion disabled. Deleting from shards sequentially...")
-            # Step 4: Sequentially delete data from shards
-            for shard, chunks in shard_map.items():
-                success = delete_from_shard(shard, chunks, collection_name)
-                if success:
-                    logging.info(f"Shard '{shard}': Successfully processed")
-                    collection_status.append((collection_name, shard, "Success"))
-                else:
-                    logging.error(f"Shard '{shard}': Failed to process")
-                    collection_status.append((collection_name, shard, "Failed"))
-
-        # Step 5: Drop the collection after processing all shards
-        try:
-            if not DRY_RUN:
-                logging.info(f"Dropping sharded collection: {collection_name}")
-                tenantdb[collection_name].drop(writeConcern=write_concern)
-                logging.info(f"Sharded collection {collection_name} dropped successfully")
-            else:
-                logging.info(f"DRY RUN: Would have dropped sharded collection: {collection_name}")
-            #collection_status.append((collection_name, "Sharded", "Success"))
-        except Exception as e:
-            logging.error(f"Error dropping sharded collection {collection_name}: {e}")
-            collection_status.append((collection_name, "Sharded", "Drop Error"))
-
-    except Exception as e:
-        logging.error(f"Unexpected error while processing collection {collection_name}: {e}")
-        collection_status.append((collection_name, "Sharded", "Unexpected Error"))
-
-
-# Function to drop unsharded collections
-# Drops unsharded collections with optional dry run simulation.
-def drop_unsharded_collection(collection_name):
-    logging.info(f"Starting drop for unsharded collection: {collection_name} (Dry run: {DRY_RUN})")
-
-    try:
-        if not DRY_RUN:
-            # Fetch and log collection stats before drop
-            stats = tenantdb.command("collstats", collection_name)
-            logging.info(f"Collection stats before drop: {stats}")
-
-            # Drop the collection with majority write concern to ensure replication safety
-            tenantdb.command({"drop": collection_name, "writeConcern": write_concern})
-            logging.info(f"Unsharded collection {collection_name} dropped successfully")
-        else:
-            logging.info(f"DRY RUN: Would have dropped unsharded collection: {collection_name}")
-        collection_status.append((collection_name, "Unsharded", "Success"))
-    except Exception as e:
-        logging.error(f"Error dropping unsharded collection {collection_name}: {e}")
-        collection_status.append((collection_name, "Unsharded", "Failure"))
-
-# Main function to process both sharded and unsharded collections
-# Iterates over all collections and calls the appropriate drop function based on sharding status.
 def perform_rolling_drop_for_all_collections():
-    try:
-        sharded_collections, unsharded_collections = get_sharded_unsharded_collections()
+    """
+    Executes a rolling drop for all collections in the tenant database.
 
-        for collection_name in sharded_collections:
+    This method categorizes collections into sharded and unsharded, processes
+    each collection by deleting documents in batches or chunks, and updates
+    status tracking for resumable operations.
+
+    Steps:
+        1. Fetch sharded and unsharded collections.
+        2. For sharded collections:
+           - Retrieve shard and chunk metadata.
+           - Skip shards marked as "completed."
+           - Process each shard using `delete_from_shard`.
+        3. For unsharded collections:
+           - Skip collections marked as "completed."
+           - Delete documents using `delete_with_full_scan`.
+           - Update status tracking.
+
+    Returns:
+        None
+    """
+    sharded_collections, unsharded_collections = get_sharded_unsharded_collections()
+    for collection_name in sharded_collections:
+        shard_map = all_chunk_info(f"{tenant_db_name}.{collection_name}")
+        is_hashed = is_hashed_shard_key(tenant_db_name, collection_name, configdb)
+        for shard, chunks in shard_map.items():
+            # Retrieve the current status and resume if necessary
+            status = get_collection_status(collection_name, shard)
+            if status and status["status"] == "completed":
+                logging.info(f"Shard {shard} of collection {collection_name} is already completed. Skipping.")
+                continue
             try:
-                logging.info(f"Processing sharded collection: {collection_name} (Dry run: {DRY_RUN})")
-                drop_sharded_collection(collection_name)
+                delete_from_shard(shard, chunks, collection_name, is_hashed)
             except Exception as e:
-                logging.error(f"Error processing sharded collection {collection_name}: {e}")
-                #collection_status.append((collection_name, "Sharded", "Failure"))
+                logging.error(f"Error processing collection {collection_name}, shard {shard}: {e}")
+    for collection_name in unsharded_collections:
+        try:
+            # Get the current status for the unsharded collection
+            status = get_collection_status(collection_name, shard=None)
+            if status and status["status"] == "completed":
+                logging.info(f"Collection {collection_name} is already completed. Skipping.")
+                continue
+            # Initialize status tracking for unsharded collection
+            total_documents = tenantdb[collection_name].estimated_document_count()
+            initialize_collection_status(collection_name, shard=None, total_chunks=1, total_documents=total_documents)
+            # Perform deletion
+            total_deleted = delete_with_full_scan(tenantdb[collection_name], deletes_per_batch, write_concern, DRY_RUN)
+            # Mark as completed
+            update_collection_status(collection_name, shard=None, chunks_processed=1, total_deleted=total_deleted, last_processed_chunk=None, status="completed")
+        except Exception as e:
+            logging.error(f"Error processing unsharded collection {collection_name}: {e}")
+            update_collection_status(collection_name, shard=None, chunks_processed=0, total_deleted=0, last_processed_chunk=None, status="failed", error=str(e))
 
-        for collection_name in unsharded_collections:
-            try:
-                logging.info(f"Processing unsharded collection: {collection_name} (Dry run: {DRY_RUN})")
-                drop_unsharded_collection(collection_name)
-            except Exception as e:
-                logging.error(f"Error processing unsharded collection {collection_name}: {e}")
-                collection_status.append((collection_name, "Unsharded", "Failure"))
-
-    except Exception as e:
-        logging.error(f"Error during rolling drop process: {e}")
-
-    log_summary()
 
 if __name__ == "__main__":
-    # Record the start time
+    """
+    Main entry point for the script.
+
+    Executes the rolling drop process for all collections in the tenant database. Logs:
+        - Start and end of the process.
+        - Whether the operation was a dry run or actual deletion.
+        - Total elapsed time in hours, minutes, and seconds.
+
+    Steps:
+        1. Log the start of the process.
+        2. Call `perform_rolling_drop_for_all_collections` to handle deletions.
+        3. Measure and log total execution time.
+        4. Log completion.
+
+    """
     start_time = time.time()
 
     logging.info(f"Starting recursive rolling drop for all collections (Dry run: {DRY_RUN})")
     perform_rolling_drop_for_all_collections()
     logging.info(f"Recursive rolling drop completed for all collections (Dry run: {DRY_RUN})")
 
-    # Record the end time and calculate elapsed time
     end_time = time.time()
     elapsed_time = end_time - start_time
-
-    # Convert to hours, minutes, seconds
     hours, rem = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(rem, 60)
 
-    # Log the time taken for completion
     logging.info(f"Script completed in {int(hours)} hours, {int(minutes)} minutes, {int(seconds)} seconds")
     logging.info("#" * 50)
