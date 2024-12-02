@@ -106,20 +106,34 @@ def retry_on_failure_infinite(delay=5, backoff=1):
     return decorator
 
 
-def is_rebalancing(config_db):
+def is_rebalancing(admin_db, namespace):
     """
     Checks if any chunk migrations (rebalancing) are currently in progress.
 
-    :param config_db: Config database connection object.
+    :param admin_db: Config database connection object.
     :return: True if rebalancing is detected, False otherwise.
     :raises: OperationFailure if the currentOp command fails.
     """
     try:
-        active_migrations = config_db.command("currentOp", {"active": True, "desc": "chunk migration"})
-        in_progress_operations = active_migrations.get("inprog", [])
-        if in_progress_operations:
-            logging.info(f"Rebalancing detected: {len(in_progress_operations)} operations in progress.")
-            return True
+        # Query for active operations
+        active_operations = admin_db.command(
+            "currentOp",
+            {"active": True}  # Fetch all active operations
+        )
+        # Extract the 'inprog' array
+        in_progress_operations = active_operations.get("inprog", [])
+
+        # Check for matching operations
+        for operation in in_progress_operations:
+            desc = operation.get("desc", "")
+            ns = operation.get("ns", "")
+            # Check if 'desc' matches expected values
+            if desc in ["migrateChunkToNewShard", "shardBalancer"]:
+                # Check if 'ns' matches or starts with any valid namespace
+                if namespace is None or ns == namespace or ns.startswith(namespace + "."):
+                    logging.info(f"Rebalancing detected. Operation: {operation}")
+                    return True
+        # If no matching operations found
         logging.info("No rebalancing operations currently in progress.")
         return False
     except OperationFailure as e:
@@ -127,14 +141,14 @@ def is_rebalancing(config_db):
         raise
 
 
-def wait_for_rebalancing_to_complete(config_db, check_interval=300):
+def wait_for_rebalancing_to_complete(admindb, namespace, check_interval=300):
     """
     Pauses the script if rebalancing is detected and waits until it completes.
 
     :param config_db: Config database connection object.
     :param check_interval: Time in seconds to wait before rechecking.
     """
-    while is_rebalancing(config_db):
+    while is_rebalancing(admindb, namespace):
         logging.warning(f"Rebalancing in progress. Pausing for {check_interval} seconds...")
         time.sleep(check_interval)
     logging.info("Rebalancing completed. Resuming operations.")
@@ -320,7 +334,7 @@ def delete_from_shard(shard, chunks, collection_name, is_hashed=False):
         shard_key = list(min_key.keys())[0]
         try:
             # Wait for rebalancing to complete before processing this chunk
-            wait_for_rebalancing_to_complete(configdb)
+            wait_for_rebalancing_to_complete(admindb, tenant_db_name)
             remaining_docs = chunk['document_count']
             while remaining_docs > 0:
                 if is_hashed:
@@ -562,6 +576,7 @@ if __name__ == "__main__":
     tenant_db_name = config['tenant_db_name']
     config_db_name = config['config_db_name']
     alcatraz_db_name = config['alcatraz_db_name']
+    admin_db_name = config['admin_db_name']
     status_tracking_collection_name = f"{tenant_db_name}_decomm_status_tracking"
     log_file = config['log_file']
     log_level_str = config['log_level']
@@ -575,6 +590,7 @@ if __name__ == "__main__":
     tenantdb = initialize_mongo_connection(mongo_uri, tenant_db_name)
     configdb = initialize_mongo_connection(mongo_uri, config_db_name)
     alcatrazdb = initialize_mongo_connection(mongo_uri, alcatraz_db_name)
+    admindb = initialize_mongo_connection(mongo_uri, alcatraz_db_name)
 
     # Log the start of the process
     start_time = time.time()
