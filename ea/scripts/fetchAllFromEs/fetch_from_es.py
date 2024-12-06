@@ -5,6 +5,8 @@ import re
 import os
 import argparse
 import logging
+from threading import Lock
+
 from logging_utils import CompressedRotatingFileHandler
 
 from elasticsearch import Elasticsearch
@@ -15,6 +17,7 @@ import random
 
 # Constants
 STATE_FILE = "progress_state.json"
+state_lock = Lock()
 
 # Logger Setup
 def setup_logger(log_folder, log_file, max_bytes=5 * 1024 * 1024, backup_count=5):
@@ -50,19 +53,19 @@ def setup_logger(log_folder, log_file, max_bytes=5 * 1024 * 1024, backup_count=5
     return logger
 
 
-# Utility Functions for State Management
-def load_state():
-    """Load progress state from a file."""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"completed_indices": [], "in_progress": {}}
-
-
 def save_state(state):
-    """Persist progress state to a file."""
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
+    """Persist progress state to a file with a lock."""
+    with state_lock:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=4)
+
+def load_state():
+    """Load progress state from a file with a lock."""
+    with state_lock:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        return {"completed_indices": [], "in_progress": {}}
 
 
 def mark_index_complete(state, index_name):
@@ -101,7 +104,7 @@ def get_indices_by_pattern(es, pattern):
     return [index['index'] for index in all_indices if re.match(pattern.replace("*", ".*"), index['index'])]
 
 
-def calculate_optimal_slices(es, index_name, max_slices=64):
+def calculate_optimal_slices(es, index_name, max_slices=8):
     """Dynamically calculate the number of slices based on index metadata."""
     index_stats = retry_indefinitely(es.indices.stats, index=index_name)
     shard_count = index_stats['_shards']['total']
@@ -220,27 +223,16 @@ def process_completed_slices(index_name, total_slices, in_progress_folder, compl
         logger.info(f"Index {index_name}: All slices moved to {completed_folder}")
 
 # Main Script
-def main(config_path):
+def main(config):
     global logger  # Use the global logger initialized in setup_logger
-
-    # Load configuration
-    try:
-        with open(config_path, "r") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        logger.error(f"Configuration file not found at {config_path}")
-        exit(1)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse configuration file: {e}")
-        exit(1)
 
     es_host = config['Elasticsearch']['host']
     index_pattern = config['Elasticsearch']['index_pattern']
     page_size = config['Elasticsearch']['page_size']
     in_progress_folder = config['AppConfig']['es_in_progress_folder']
-    completed_folder = config['AppConfig']['es_completed_folder']
+    completed_folder = config['AppConfig']['es_complete_folder']
     fields_to_export = config['Elasticsearch']['fields_to_export']
-    merge_enabled = config['Elasticsearch'].get('merge_slices', True)  # Default to True if not specified
+    merge_enabled = config['Elasticsearch'].get('merge_slices', True)
 
     # Ensure folders exist
     for folder in [in_progress_folder, completed_folder]:
@@ -264,7 +256,7 @@ def main(config_path):
             continue
 
         total_slices = calculate_optimal_slices(es, index_name)
-        with ThreadPoolExecutor(max_workers=min(total_slices, 32)) as executor:
+        with ThreadPoolExecutor(max_workers=min(total_slices, 4)) as executor:
             futures = [
                 executor.submit(scroll_slice, es, slice_id, total_slices, index_name, state, in_progress_folder, fields_to_export, page_size)
                 for slice_id in range(total_slices)
@@ -286,10 +278,10 @@ def load_config(config_path):
         with open(config_path, 'r') as config_file:
             return json.load(config_file)
     except FileNotFoundError:
-        logger.error(f"Configuration file not found at {config_path}")
+        print(f"Configuration file not found at {config_path}")  # Use print
         exit(1)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse configuration file: {e}")
+        print(f"Failed to parse configuration file: {e}")  # Use print
         exit(1)
 
 def initialize_logger(config):

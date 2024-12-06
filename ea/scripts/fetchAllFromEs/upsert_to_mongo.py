@@ -301,7 +301,6 @@ def main(config):
     tenantdb_name = config["MongoDB"]["tenantdb"]
     collection_name = config["MongoDB"]["collection"]
     unique_key = config["MongoDB"].get("unique_key", "_id")
-    folder_to_watch = config["AppConfig"]["es_complete_folder"]
     completed_folder = config["AppConfig"]["mongo_complete_folder"]
     timeout_minutes = config["AppConfig"]["timeout_minutes"]
     poll_interval = config["AppConfig"]["poll_interval"]
@@ -309,9 +308,11 @@ def main(config):
     max_files = config["AppConfig"]["max_files"]
     max_workers_per_file = config["AppConfig"]["max_workers_per_file"]
     delete_after_upsert = config["AppConfig"]["delete_after_upsert"]
+    log_folder = config["AppConfig"]["log_folder"]
+    folder_to_watch = config["AppConfig"]["es_complete_folder"]
 
     # Ensure required directories exist
-    ensure_directories_exist([folder_to_watch, completed_folder, config["AppConfig"]["log_folder"]])
+    ensure_directories_exist([folder_to_watch, completed_folder, log_folder])
 
     # Connect to MongoDB
     client = connect_to_mongo()
