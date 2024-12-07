@@ -73,13 +73,13 @@ signal.signal(signal.SIGTERM, handle_signal)
 @retry_on_failure()
 def connect_to_mongo():
     """Attempts to connect to MongoDB with retries on failure."""
-    uri = config["shared_uri"]
+    uri = config["MongoDB"]["shared_uri"]
     client = MongoClient(
         uri,
         maxPoolSize=50,  # Maximum number of connections in the pool
         minPoolSize=5,   # Optional: Minimum number of connections in the pool
-        serverSelectionTimeoutMS=config["connection_timeout"],
-        socketTimeoutMS=config["socket_timeout"]
+        serverSelectionTimeoutMS=config["MongoDB"]["connection_timeout"],
+        socketTimeoutMS=config["MongoDB"]["socket_timeout"]
     )
     client.admin.command('ping')  # Test connection
     logging.info("Connected to MongoDB successfully.")
