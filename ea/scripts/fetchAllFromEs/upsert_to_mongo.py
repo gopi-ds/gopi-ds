@@ -113,7 +113,9 @@ def bulk_upsert(unique_gcid_collection, records, unique_key):
                 filter_query = {unique_key: record[unique_key]} if unique_key in record else {}
                 bulk_operations.append(
                     pymongo.UpdateOne(
-                        filter_query, {"$set": record}, upsert=True
+                        filter_query,
+                        {"$setOnInsert": record},  # Only insert if the document is new
+                        upsert=True
                     )
                 )
 
@@ -121,7 +123,6 @@ def bulk_upsert(unique_gcid_collection, records, unique_key):
                 result = unique_gcid_collection.bulk_write(bulk_operations)
                 logging.info(
                     f"Upserted {result.upserted_count} records, "
-                    f"matched {result.matched_count}, modified {result.modified_count}."
                 )
             break  # Exit the loop if operation succeeds
         except BulkWriteError as bwe:
